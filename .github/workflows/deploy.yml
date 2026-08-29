@@ -1,0 +1,121 @@
+name: Deploy Amazon ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  # Região da AWS configurada no Terraform
+  AWS_REGION: us-east-1
+  # Nome do repositório no Amazon ECR
+  ECR_REPOSITORY: minha-app-repo
+  # Nome do serviço do ECS
+  ECS_SERVICE: app-service
+  # Nome do cluster ECS (conforme está no main.tf)
+  ECS_CLUSTER: app-cluster
+  # Caminho para a definição de task do ECS
+  ECS_TASK_DEFINITION: task-definition.json
+  # Nome do container dentro da Task Definition
+  CONTAINER_NAME: app-container
+
+jobs:
+  # -------------------------------------------------------------
+  # ETAPA 1: BUILD & TEST
+  # -------------------------------------------------------------
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js (ou runtime do projeto)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Executar Testes Automatizados
+        run: npm test
+
+  # -------------------------------------------------------------
+  # ETAPA 2: CONTAINERIZATION (BUILD & PUSH ECR)
+  # -------------------------------------------------------------
+  build-and-push-ecr:
+    name: Containerization (Docker -> ECR)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag e Push da Imagem Docker para o ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Compila a imagem Docker a partir do Dockerfile na raiz
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Publica as tags no registro da AWS (ECR)
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Exporta a imagem com tag única para o job de Deploy
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # -------------------------------------------------------------
+  # ETAPA 3: DEPLOY AUTOMÁTICO NO AWS ECS FARGATE
+  # -------------------------------------------------------------
+  deploy-to-ecs:
+    name: Deploy
+    needs: build-and-push-ecr
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atualizar Tag da Imagem no arquivo Task Definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push-ecr.outputs.image }}
+
+      - name: Publicar nova Task Definition e Atualizar o Serviço no ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
